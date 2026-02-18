@@ -18,10 +18,9 @@ from aiogram.types import (
 )
 from openai import AsyncOpenAI
 
-# --- НАСТРОЙКИ (Вставь свои данные сюда) ---
+# --- НАСТРОЙКИ ---
 BOT_TOKEN = "7802243169:AAHmow-BnBE9T5PK5FxrbyQnf4caklqmB9c"
 OPENAI_API_KEY = "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"
-# Твой ID обязательно числом!
 MAIN_ADMIN_ID = 7199344406 
 
 # Инициализация
@@ -79,7 +78,6 @@ def init_db():
     )''')
 
     # Гарантируем, что главный админ есть в базе с ролью 2
-    # Это исправляет ошибку, когда команда /admin не работала
     cursor.execute("INSERT OR IGNORE INTO users (user_id, role) VALUES (?, 2)", (MAIN_ADMIN_ID,))
     cursor.execute("UPDATE users SET role=2 WHERE user_id=?", (MAIN_ADMIN_ID,))
     
@@ -182,7 +180,10 @@ async def send_broadcast_task(event_id):
             logger.error(f"Не удалось отправить юзеру {user[0]}: {e}")
 
     # Уведомляем админа об успехе
-    await bot.send_message(MAIN_ADMIN_ID, f"✅ Авто-рассылка завершена! Отправлено: {count}")
+    try:
+        await bot.send_message(MAIN_ADMIN_ID, f"✅ Авто-рассылка завершена! Отправлено: {count}")
+    except:
+        pass
 
 
 # --- ХЕНДЛЕРЫ: СТАРТ И МЕНЮ ---
@@ -286,7 +287,8 @@ async def cb_reg(cb: CallbackQuery):
 async def cb_ask(cb: CallbackQuery, state: FSMContext):
     eid = cb.data.split("_")[1]
     await state.update_data(event_id=eid)
-    await message.answer("Напишите ваш вопрос спикерам этого мероприятия:")
+    # ИСПРАВЛЕНИЕ: используем cb.message вместо message
+    await cb.message.answer("Напишите ваш вопрос спикерам этого мероприятия:")
     await state.set_state(UserStates.writing_question)
     await cb.answer()
 
