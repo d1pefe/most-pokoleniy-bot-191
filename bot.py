@@ -19,9 +19,10 @@ from aiogram.types import (
 from openai import AsyncOpenAI
 
 # --- НАСТРОЙКИ ---
+# ⚠️ ВСТАВЬТЕ СЮДА ВАШИ КЛЮЧИ
 BOT_TOKEN = "7802243169:AAHmow-BnBE9T5PK5FxrbyQnf4caklqmB9c"
 OPENAI_API_KEY = "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"
-MAIN_ADMIN_ID = 7199344406 
+MAIN_ADMIN_ID = 7233585816 
 
 # Инициализация
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -63,7 +64,7 @@ def init_db():
     cursor.execute('''CREATE TABLE IF NOT EXISTS submissions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        event_id INTEGER, -- NULL если это общая тема
+        event_id INTEGER, -- NULL если это общая тема из главного меню
         type TEXT, -- question, case, topic
         text TEXT,
         created_at TEXT
@@ -77,7 +78,7 @@ def init_db():
         PRIMARY KEY (user_id, event_id)
     )''')
 
-    # Гарантируем, что главный админ есть в базе с ролью 2
+    # Гарантируем, что главный админ есть в базе
     cursor.execute("INSERT OR IGNORE INTO users (user_id, role) VALUES (?, 2)", (MAIN_ADMIN_ID,))
     cursor.execute("UPDATE users SET role=2 WHERE user_id=?", (MAIN_ADMIN_ID,))
     
@@ -93,20 +94,20 @@ class AdminStates(StatesGroup):
     new_event_desc = State()
     new_event_date = State()
     new_event_photo = State()
-    broadcast_schedule = State() # Ввод времени для рассылки
+    broadcast_schedule = State()
     add_admin = State()
 
 class UserStates(StatesGroup):
     writing_question = State()
     writing_case = State()
-    writing_topic = State()
+    writing_topic = State() # Общее предложение темы
 
 # --- КЛАВИАТУРЫ ---
 def kb_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="📅 Ближайшее мероприятие")],
-        [KeyboardButton(text="💡 Предложить тему"), KeyboardButton(text="📜 Моя ситуация")],
-        [KeyboardButton(text="📚 О проекте")]
+        [KeyboardButton(text="📅 Афиша встреч")],
+        [KeyboardButton(text="💡 Предложить тему"), KeyboardButton(text="📬 Анонимный ящик")],
+        [KeyboardButton(text="ℹ️ О клубе")]
     ], resize_keyboard=True)
 
 def kb_admin_main():
@@ -120,22 +121,26 @@ def kb_admin_main():
 def kb_event_actions(event_id):
     """Кнопки под постом о мероприятии"""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Зарегистрироваться", callback_data=f"reg_{event_id}")],
-        [InlineKeyboardButton(text="❓ Задать вопрос", callback_data=f"ask_{event_id}")],
-        [InlineKeyboardButton(text="📝 Рассказать кейс", callback_data=f"case_{event_id}")]
+        [InlineKeyboardButton(text="✅ Иду / Занять место", callback_data=f"reg_{event_id}")],
+        [InlineKeyboardButton(text="❓ Задать вопрос спикеру", callback_data=f"ask_{event_id}")],
+        [InlineKeyboardButton(text="🔥 Разобрать мой кейс", callback_data=f"case_{event_id}")]
     ])
 
 # --- ЛОГИКА ИИ ---
-async def ai_analyze(text_data):
+async def ai_analyze(text_data, event_title="Общее"):
     if not ai_client: return "⚠️ ИИ не подключен (нет ключа)."
+    
     prompt = (
-        "Ты помощник организатора дискуссионного клуба. "
-        "Проанализируй эти сообщения пользователей. "
-        "1. Выдели 3 главные боли/проблемы. "
-        "2. Оцени эмоциональный фон. "
-        "3. Предложи 1 провокационный вопрос для начала дискуссии.\n\n"
-        f"Данные:\n{text_data[:3000]}" # Обрезаем, чтобы не превысить лимиты
+        "Ты — профессиональный модератор педагогических дискуссий и психолог. "
+        f"Твоя задача — проанализировать массив сообщений от участников перед мероприятием на тему: '{event_title}'.\n\n"
+        f"Вот список вопросов и кейсов:\n{text_data[:3500]}\n\n"
+        "Сформируй отчет для ведущего в формате HTML (без markdown разметки ```):\n"
+        "<b>1. Эмоциональный градус:</b> (Опиши одним предложением: напряженный, заинтересованный, агрессивный и т.д.)\n"
+        "<b>2. ТОП-3 боли аудитории:</b> (Сгруппируй похожие вопросы и выдели 3 главные проблемы)\n"
+        "<b>3. Провокационный вопрос:</b> (Сформулируй 1 острый вопрос для начала дискуссии, который зацепит всех)\n"
+        "<b>4. Рекомендация ведущему:</b> (На что сделать упор, чего избегать)"
     )
+    
     try:
         resp = await ai_client.chat.completions.create(
             model="gpt-3.5-turbo",
@@ -145,23 +150,23 @@ async def ai_analyze(text_data):
     except Exception as e:
         return f"Ошибка ИИ: {e}"
 
-# --- ФУНКЦИЯ РАССЫЛКИ (Вызывается планировщиком) ---
+# --- ФУНКЦИЯ РАССЫЛКИ ---
 async def send_broadcast_task(event_id):
     conn = get_db()
-    # Получаем данные события
     event = conn.execute("SELECT title, description, event_date, photo_id FROM events WHERE id=?", (event_id,)).fetchone()
-    # Получаем всех пользователей
     users = conn.execute("SELECT user_id FROM users").fetchall()
     conn.close()
 
     if not event: return
 
+    # Улучшенный текст рассылки
     text = (
-        f"🔔 <b>Напоминание о встрече!</b>\n\n"
-        f"Тема: <b>{event[0]}</b>\n"
-        f"Когда: {event[2]}\n\n"
-        f"{event[1]}\n\n"
-        "👇 Выберите действие ниже:"
+        f"🔔 <b>АНОНС: {event[0]}</b>\n\n"
+        f"Тема, о которой часто молчат, но которая касается каждого.\n\n"
+        f"👇 <b>О чем будем говорить:</b>\n{event[1]}\n\n"
+        f"🗓 <b>Когда:</b> {event[2]}\n"
+        f"📍 <b>Где:</b> Актовый зал / Онлайн\n\n"
+        "Ваш голос важен! Чтобы встреча прошла продуктивно, мы собираем вопросы заранее."
     )
     kb = kb_event_actions(event_id)
     
@@ -175,11 +180,10 @@ async def send_broadcast_task(event_id):
             else:
                 await bot.send_message(user[0], text, reply_markup=kb)
             count += 1
-            await asyncio.sleep(0.05) # Анти-спам задержка
+            await asyncio.sleep(0.05) 
         except Exception as e:
             logger.error(f"Не удалось отправить юзеру {user[0]}: {e}")
 
-    # Уведомляем админа об успехе
     try:
         await bot.send_message(MAIN_ADMIN_ID, f"✅ Авто-рассылка завершена! Отправлено: {count}")
     except:
@@ -191,52 +195,65 @@ async def send_broadcast_task(event_id):
 async def start(message: Message):
     user_id = message.from_user.id
     conn = get_db()
-    
-    # Проверка: если это ГЛАВНЫЙ АДМИН, сразу даем роль 2
     role = 2 if user_id == MAIN_ADMIN_ID else 0
     
-    # Обновляем или вставляем
     conn.execute("""
         INSERT INTO users (user_id, username, full_name, role, join_date) 
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET full_name=excluded.full_name, username=excluded.username
     """, (user_id, message.from_user.username, message.from_user.full_name, role, datetime.now().isoformat()))
     
-    # Если это админ, форсируем обновление роли (на случай старой базы)
     if user_id == MAIN_ADMIN_ID:
         conn.execute("UPDATE users SET role=2 WHERE user_id=?", (user_id,))
-
     conn.commit()
     conn.close()
     
-    await message.answer(f"Привет, {message.from_user.full_name}! Это бот 'Мост поколений'.", reply_markup=kb_main_menu())
+    welcome_text = (
+        f"Здравствуйте, {message.from_user.full_name}! 👋\n\n"
+        "Я — цифровой помощник клуба <b>«Мост поколений»</b>. "
+        "Здесь мы строим диалог между родителями, учителями и учениками.\n\n"
+        "Через меня вы можете регистрироваться на встречи, задавать острые вопросы и делиться ситуациями (даже анонимно)."
+    )
+    await message.answer(welcome_text, reply_markup=kb_main_menu())
 
 # --- ХЕНДЛЕРЫ: ПОЛЬЗОВАТЕЛЬСКИЕ ---
-@dp.message(F.text == "📚 О проекте")
+@dp.message(F.text == "ℹ️ О клубе")
 async def about(message: Message):
-    await message.answer("Мы создаем диалог между поколениями. Здесь можно обсудить проблемы школы, семьи и общения.")
+    await message.answer("Мы создаем диалог между поколениями. Здесь можно обсудить проблемы школы, семьи и общения в безопасной обстановке.")
 
 @dp.message(F.text == "💡 Предложить тему")
 async def suggest_topic(message: Message, state: FSMContext):
-    await message.answer("Какую тему вы хотите обсудить в будущем?")
+    # Очищаем event_id, так как это общее предложение
+    await state.update_data(event_id=None)
+    await message.answer("О чем нам стоит поговорить в следующий раз? Мы ищем темы, которые реально волнуют школу.")
     await state.set_state(UserStates.writing_topic)
 
-@dp.message(F.text == "📜 Моя ситуация")
-async def my_case(message: Message, state: FSMContext):
-    await message.answer("Опишите вашу ситуацию анонимно. Мы сохраним её для анализа.")
+@dp.message(F.text == "📬 Анонимный ящик") # Бывшее "Моя ситуация"
+async def my_case_general(message: Message, state: FSMContext):
+    # Очищаем event_id
+    await state.update_data(event_id=None)
+    await message.answer(
+        "Здесь вы можете выговориться. Напишите, что происходит.\n"
+        "Мы читаем все сообщения, но <b>никогда не раскрываем авторов</b>."
+    )
     await state.set_state(UserStates.writing_case)
 
-@dp.message(F.text == "📅 Ближайшее мероприятие")
+@dp.message(F.text == "📅 Афиша встреч")
 async def nearest_event(message: Message):
     conn = get_db()
     event = conn.execute("SELECT id, title, description, event_date, photo_id FROM events WHERE is_active=1 ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     
     if not event:
-        await message.answer("Пока нет анонсов.")
+        await message.answer("Пока нет анонсов будущих встреч. Загляните позже!")
         return
         
-    text = f"🗓 <b>{event[1]}</b>\n🕒 {event[3]}\n\n{event[2]}"
+    text = (
+        f"🗓 <b>{event[1]}</b>\n"
+        f"🕒 {event[3]}\n\n"
+        f"{event[2]}\n\n"
+        "👇 <b>Что будем делать:</b>"
+    )
     kb = kb_event_actions(event[0])
     
     if event[4]:
@@ -251,7 +268,7 @@ async def nearest_event(message: Message):
 async def save_user_input(message: Message, state: FSMContext):
     st = await state.get_state()
     data = await state.get_data()
-    event_id = data.get('event_id') # Может быть None
+    event_id = data.get('event_id') # Будет None для общих вопросов, и ID для конкретных
     
     type_map = {
         UserStates.writing_topic: 'topic',
@@ -266,7 +283,14 @@ async def save_user_input(message: Message, state: FSMContext):
     conn.commit()
     conn.close()
     
-    await message.answer("Спасибо! Ваше сообщение принято.", reply_markup=kb_main_menu())
+    if submission_type == 'question':
+        ans = "<b>Принято!</b> Ваш вопрос передан модератору. Спасибо за смелость."
+    elif submission_type == 'case':
+        ans = "<b>История сохранена.</b> Мы убрали ваше имя, чтобы сохранить анонимность."
+    else:
+        ans = "Спасибо! Ваше предложение записано."
+
+    await message.answer(ans, reply_markup=kb_main_menu())
     await state.clear()
 
 # Кнопки под ивентом (регистрация, вопросы)
@@ -278,17 +302,16 @@ async def cb_reg(cb: CallbackQuery):
         conn.execute("INSERT INTO registrations (user_id, event_id, registered_at) VALUES (?, ?, ?)",
                      (cb.from_user.id, eid, datetime.now().isoformat()))
         conn.commit()
-        await cb.answer("✅ Вы записаны!", show_alert=True)
+        await cb.answer("✅ Вы в списке! Напомним за день до встречи.", show_alert=True)
     except sqlite3.IntegrityError:
-        await cb.answer("Вы уже записаны.", show_alert=True)
+        await cb.answer("Вы уже записаны на это событие.", show_alert=True)
     conn.close()
 
 @dp.callback_query(F.data.startswith("ask_"))
 async def cb_ask(cb: CallbackQuery, state: FSMContext):
     eid = cb.data.split("_")[1]
     await state.update_data(event_id=eid)
-    # ИСПРАВЛЕНИЕ: используем cb.message вместо message
-    await cb.message.answer("Напишите ваш вопрос спикерам этого мероприятия:")
+    await cb.message.answer("Напишите ваш вопрос спикерам этого мероприятия в одном сообщении:")
     await state.set_state(UserStates.writing_question)
     await cb.answer()
 
@@ -296,7 +319,10 @@ async def cb_ask(cb: CallbackQuery, state: FSMContext):
 async def cb_case(cb: CallbackQuery, state: FSMContext):
     eid = cb.data.split("_")[1]
     await state.update_data(event_id=eid)
-    await cb.message.answer("Опишите ситуацию для разбора на этом мероприятии:")
+    await cb.message.answer(
+        "Опишите конфликтную или сложную ситуацию по теме встречи.\n"
+        "<i>Например: 'Ученик отказывается сдавать телефон...'</i>"
+    )
     await state.set_state(UserStates.writing_case)
     await cb.answer()
 
@@ -305,37 +331,36 @@ async def cb_case(cb: CallbackQuery, state: FSMContext):
 @dp.message(Command("admin"))
 async def admin_start(message: Message):
     conn = get_db()
-    # Жесткая проверка: либо ID совпадает с MAIN, либо роль в базе > 0
     user = conn.execute("SELECT role FROM users WHERE user_id=?", (message.from_user.id,)).fetchone()
     conn.close()
     
     if message.from_user.id == MAIN_ADMIN_ID or (user and user[0] > 0):
-        await message.answer("Добро пожаловать в админку!", reply_markup=kb_admin_main())
+        await message.answer("Панель управления:", reply_markup=kb_admin_main())
     else:
-        await message.answer(f"⛔️ Отказано в доступе. Ваш ID: {message.from_user.id}")
+        await message.answer("⛔️ Нет прав доступа.")
 
-# 1. Создание
+# 1. Создание (Без изменений, только тексты чуть мягче)
 @dp.callback_query(F.data == "adm_create")
 async def adm_create(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("Название мероприятия?")
+    await cb.message.answer("Введите название мероприятия:")
     await state.set_state(AdminStates.new_event_title)
 
 @dp.message(AdminStates.new_event_title)
 async def adm_title(m: Message, state: FSMContext):
     await state.update_data(title=m.text)
-    await m.answer("Описание?")
+    await m.answer("Введите описание (тезисы, о чем встреча):")
     await state.set_state(AdminStates.new_event_desc)
 
 @dp.message(AdminStates.new_event_desc)
 async def adm_desc(m: Message, state: FSMContext):
     await state.update_data(desc=m.text)
-    await m.answer("Дата проведения (текстом, напр. '25 Мая 18:00'):")
+    await m.answer("Дата и время (текстом, напр. '25 Мая 18:00'):")
     await state.set_state(AdminStates.new_event_date)
 
 @dp.message(AdminStates.new_event_date)
 async def adm_date(m: Message, state: FSMContext):
     await state.update_data(date=m.text)
-    await m.answer("Пришлите картинку (или напишите 'нет'):")
+    await m.answer("Пришлите афишу/картинку (или напишите 'нет'):")
     await state.set_state(AdminStates.new_event_photo)
 
 @dp.message(AdminStates.new_event_photo)
@@ -364,10 +389,7 @@ async def adm_ask_time(cb: CallbackQuery, state: FSMContext):
     eid = cb.data.split("_")[1]
     await state.update_data(event_id=eid)
     await cb.message.answer(
-        "Введите дату и время отправки рассылки в формате:\n"
-        "<b>YYYY-MM-DD HH:MM</b>\n"
-        "Пример: 2024-05-20 14:30\n"
-        "(Часовой пояс сервера!)"
+        "Введите дату рассылки (серверное время):\nFormat: <b>YYYY-MM-DD HH:MM</b>"
     )
     await state.set_state(AdminStates.broadcast_schedule)
 
@@ -377,14 +399,11 @@ async def adm_set_schedule(m: Message, state: FSMContext):
         run_date = datetime.strptime(m.text, "%Y-%m-%d %H:%M")
         data = await state.get_data()
         event_id = data['event_id']
-        
-        # Добавляем задачу в планировщик
         scheduler.add_job(send_broadcast_task, 'date', run_date=run_date, args=[event_id])
-        
-        await m.answer(f"✅ Рассылка запланирована на {run_date}!", reply_markup=kb_admin_main())
+        await m.answer(f"✅ Рассылка уйдет {run_date}!", reply_markup=kb_admin_main())
         await state.clear()
     except ValueError:
-        await m.answer("❌ Ошибка формата. Попробуйте еще раз: YYYY-MM-DD HH:MM")
+        await m.answer("❌ Формат: YYYY-MM-DD HH:MM")
 
 # 3. Просмотр ответов + ИИ
 @dp.callback_query(F.data == "adm_view_answers")
@@ -392,49 +411,87 @@ async def adm_view(cb: CallbackQuery):
     conn = get_db()
     events = conn.execute("SELECT id, title FROM events ORDER BY id DESC LIMIT 5").fetchall()
     conn.close()
+    
+    # Кнопки событий + Общий ящик
     btns = [[InlineKeyboardButton(text=f"📂 {e[1]}", callback_data=f"data_{e[0]}")] for e in events]
-    await cb.message.answer("По какому событию показать данные?", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+    btns.insert(0, [InlineKeyboardButton(text="📥 Общий ящик (Вне тем)", callback_data="data_general")])
+    
+    await cb.message.answer("Выберите источник данных:", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
 
 @dp.callback_query(F.data.startswith("data_"))
 async def adm_show_data(cb: CallbackQuery):
-    eid = cb.data.split("_")[1]
+    param = cb.data.split("_")[1] # 'general' или ID события
     conn = get_db()
     
-    # Считаем регистрации
-    reg_count = conn.execute("SELECT count(*) FROM registrations WHERE event_id=?", (eid,)).fetchone()[0]
-    
-    # Берем вопросы
-    questions = conn.execute("SELECT text FROM submissions WHERE event_id=? AND type='question'", (eid,)).fetchall()
-    cases = conn.execute("SELECT text FROM submissions WHERE event_id=? AND type='case'", (eid,)).fetchall()
+    if param == 'general':
+        # Берем данные где event_id IS NULL
+        event_title = "Общий ящик"
+        questions = conn.execute("SELECT text FROM submissions WHERE event_id IS NULL AND type='question'").fetchall()
+        cases = conn.execute("SELECT text FROM submissions WHERE event_id IS NULL AND type='case'").fetchall()
+        topics = conn.execute("SELECT text FROM submissions WHERE event_id IS NULL AND type='topic'").fetchall()
+        reg_count = 0
+        extra_text = f"Предложения тем: {len(topics)}\n"
+        full_text = "Темы:\n" + "\n".join([t[0] for t in topics]) + "\n\n"
+    else:
+        # Берем данные по ID
+        eid = int(param)
+        event = conn.execute("SELECT title FROM events WHERE id=?", (eid,)).fetchone()
+        event_title = event[0] if event else "Событие удалено"
+        
+        reg_count = conn.execute("SELECT count(*) FROM registrations WHERE event_id=?", (eid,)).fetchone()[0]
+        questions = conn.execute("SELECT text FROM submissions WHERE event_id=? AND type='question'", (eid,)).fetchall()
+        cases = conn.execute("SELECT text FROM submissions WHERE event_id=? AND type='case'", (eid,)).fetchall()
+        extra_text = ""
+        full_text = ""
+
     conn.close()
     
-    text_report = f"📊 <b>Отчет по мероприятию</b>\nЗаписей: {reg_count}\nВопросов: {len(questions)}\nКейсов: {len(cases)}\n\n"
+    text_report = (
+        f"📊 <b>{event_title}</b>\n"
+        f"Регистраций: {reg_count}\n"
+        f"Вопросов: {len(questions)}\n"
+        f"Кейсов: {len(cases)}\n"
+        f"{extra_text}\n"
+    )
     
-    # Собираем текст для ИИ
-    full_text = "Вопросы:\n" + "\n".join([q[0] for q in questions]) + "\n\nКейсы:\n" + "\n".join([c[0] for c in cases])
+    # Собираем полный текст для отчета или ИИ
+    full_text += "Вопросы:\n" + "\n".join([q[0] for q in questions]) + "\n\nКейсы:\n" + "\n".join([c[0] for c in cases])
     
-    if len(full_text) > 20:
-        btn_ai = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧠 Нейро-анализ", callback_data=f"ai_{eid}")]])
-        await cb.message.answer(text_report + "Нажмите кнопку для анализа содержимого.", reply_markup=btn_ai)
-        # Отправляем файл или длинный текст (здесь просто текст для примера)
+    # Клавиатура ИИ
+    btn_ai = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧠 Нейро-анализ", callback_data=f"ai_{param}")]])
+    
+    if len(full_text) > 30: # Если есть хоть какой-то текст
+        await cb.message.answer(text_report, reply_markup=btn_ai)
         if len(full_text) < 4000:
-            await cb.message.answer(f"📜 <b>Данные:</b>\n{full_text}")
+            await cb.message.answer(f"📜 <b>Содержимое:</b>\n{full_text}")
         else:
             await cb.message.answer("Данных слишком много, показаны первые 4000 символов.")
             await cb.message.answer(full_text[:4000])
     else:
-        await cb.message.answer(text_report + "Данных пока нет.")
+        await cb.message.answer(text_report + "📭 Данных пока нет.")
 
 @dp.callback_query(F.data.startswith("ai_"))
 async def adm_run_ai(cb: CallbackQuery):
-    eid = cb.data.split("_")[1]
-    await cb.message.answer("⏳ Думаю...")
-    conn = get_db()
-    questions = conn.execute("SELECT text FROM submissions WHERE event_id=?", (eid,)).fetchall()
-    conn.close()
-    full_text = "\n".join([q[0] for q in questions])
+    param = cb.data.split("_")[1]
+    await cb.message.answer("⏳ Анализирую... Это может занять секунд 10.")
     
-    res = await ai_analyze(full_text)
+    conn = get_db()
+    if param == 'general':
+        data = conn.execute("SELECT text FROM submissions WHERE event_id IS NULL").fetchall()
+        title = "Общий фидбек и темы"
+    else:
+        data = conn.execute("SELECT text FROM submissions WHERE event_id=?", (param,)).fetchall()
+        title_row = conn.execute("SELECT title FROM events WHERE id=?", (param,)).fetchone()
+        title = title_row[0] if title_row else "Событие"
+    conn.close()
+    
+    full_text = "\n".join([d[0] for d in data])
+    
+    if not full_text:
+        await cb.message.answer("Нечего анализировать.")
+        return
+
+    res = await ai_analyze(full_text, title)
     await cb.message.answer(res)
 
 # 4. Добавить админа
@@ -458,7 +515,7 @@ async def adm_save_admin(m: Message, state: FSMContext):
 
 async def main():
     init_db()
-    scheduler.start() # Запускаем планировщик
+    scheduler.start()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
