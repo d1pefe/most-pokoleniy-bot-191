@@ -19,6 +19,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     Message, CallbackQuery, FSInputFile
 )
+from aiogram.exceptions import TelegramRetryAfter, TelegramAPIError
 
 # --- НАСТРОЙКИ ---
 BOT_TOKEN = "7802243169:AAHmow-BnBE9T5PK5FxrbyQnf4caklqmB9c"
@@ -384,12 +385,25 @@ async def free_cast_send(message: Message, state: FSMContext):
     conn.close()
     count = 0
     await message.answer("⏳ Начинаю рассылку...")
+    
     for u in users:
         try:
             await message.copy_to(u[0])
             count += 1
             await asyncio.sleep(0.05)
-        except: pass
+        except TelegramRetryAfter as e:
+            logger.warning(f"Лимит TelegramAPI. Ожидание {e.retry_after} секунд.")
+            await asyncio.sleep(e.retry_after)
+            try:
+                await message.copy_to(u[0])
+                count += 1
+            except Exception:
+                pass
+        except TelegramAPIError as e:
+            logger.warning(f"Не удалось отправить пользователю {u[0]}: {e}")
+        except Exception as e:
+            logger.error(f"Непредвиденная ошибка при отправке {u[0]}: {e}")
+            
     await message.answer(f"✅ Рассылка завершена. Доставлено: {count}")
     await state.clear()
 
@@ -539,6 +553,73 @@ async def evt_menu(cb: CallbackQuery):
          InlineKeyboardButton(text="🗑 Удалить", callback_data=f"evt_del_{eid}")]
     ]
     await cb.message.edit_text(f"🔧 <b>{e[0]}</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=btns))
+
+# Авто-рассылка анонса мероприятия
+@dp.callback_query(F.data.startswith("evt_cast_"))
+async def evt_broadcast(cb: CallbackQuery):
+    eid = cb.data.split("_")[2]
+    conn = get_db()
+    ev = conn.execute("SELECT title, description, event_date, photo_id FROM events WHERE id=?", (eid,)).fetchone()
+    users = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    
+    if not ev:
+        return await cb.answer("Мероприятие не найдено!", show_alert=True)
+        
+    await cb.message.answer("⏳ Начинаю авторассылку анонса всем пользователям...")
+    count = 0
+    text = f"📢 <b>Анонс мероприятия!</b>\n\n🗓 <b>{ev[0]}</b>\n🕒 {ev[2]}\n\n{ev[1]}\n\n👇 <b>Записывайтесь через меню бота!</b>"
+    kb = kb_event_actions(eid)
+    
+    for u in users:
+        try:
+            if ev[3]:
+                await bot.send_photo(u[0], photo=ev[3], caption=text, reply_markup=kb)
+            else:
+                await bot.send_message(u[0], text=text, reply_markup=kb)
+            count += 1
+            await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e:
+            logger.warning(f"Лимит. Ожидание {e.retry_after} сек.")
+            await asyncio.sleep(e.retry_after)
+            try:
+                if ev[3]:
+                    await bot.send_photo(u[0], photo=ev[3], caption=text, reply_markup=kb)
+                else:
+                    await bot.send_message(u[0], text=text, reply_markup=kb)
+                count += 1
+            except Exception:
+                pass
+        except TelegramAPIError:
+            pass
+        except Exception:
+            pass
+            
+    await cb.message.answer(f"✅ Анонс разослан. Доставлено: {count}")
+    await cb.answer()
+
+# === ИСПРАВЛЕННЫЙ БЛОК: Удаление мероприятия ===
+@dp.callback_query(F.data.startswith("evt_del_"))
+async def evt_delete(cb: CallbackQuery):
+    try:
+        # 1. Жестко конвертируем строку в число для базы данных
+        eid = int(cb.data.split("_")[2])
+        
+        # 2. Используем контекстный менеджер для гарантии commit()
+        with get_db() as conn:
+            conn.execute("DELETE FROM events WHERE id=?", (eid,))
+            conn.execute("DELETE FROM registrations WHERE event_id=?", (eid,))
+            conn.execute("DELETE FROM submissions WHERE event_id=?", (eid,))
+            conn.commit()
+            
+        # 3. Обязательно "гасим" индикатор загрузки у кнопки с всплывающим окном
+        await cb.answer("✅ Мероприятие успешно удалено!", show_alert=True)
+        
+        # 4. Обновляем сообщение
+        await cb.message.edit_text("✅ Мероприятие и все связанные данные удалены.", reply_markup=kb_admin_main())
+    except Exception as e:
+        logger.error(f"Ошибка при удалении мероприятия: {e}")
+        await cb.answer("Произошла ошибка при удалении.", show_alert=True)
 
 # Промпт ИИ для Мероприятия
 @dp.callback_query(F.data.startswith("evt_ai_"))
@@ -843,9 +924,38 @@ async def surv_ai_prompt(cb: CallbackQuery):
     await cb.message.answer(prompt)
     await cb.answer()
 
+# === ИСПРАВЛЕННЫЙ БЛОК: Удаление анкеты ===
+@dp.callback_query(F.data.startswith("sdel_"))
+async def surv_delete(cb: CallbackQuery):
+    try:
+        # Конвертация в int и менеджер контекста
+        sid = int(cb.data.split("_")[1])
+        with get_db() as conn:
+            conn.execute("DELETE FROM surveys WHERE id=?", (sid,))
+            conn.execute("DELETE FROM questions WHERE survey_id=?", (sid,))
+            conn.execute("DELETE FROM answers WHERE survey_id=?", (sid,))
+            conn.commit()
+            
+        await cb.answer("✅ Анкета успешно удалена!", show_alert=True)
+        await cb.message.edit_text("✅ Анкета и все ответы удалены.", reply_markup=kb_admin_main())
+    except Exception as e:
+        logger.error(f"Ошибка при удалении анкеты: {e}")
+        await cb.answer("Произошла ошибка при удалении.", show_alert=True)
+
+# Фоновая задача
+async def background_reminder_task():
+    """Фоновая задача для apscheduler. Пример: ежедневная проверка предстоящих мероприятий."""
+    logger.info("Запуск фоновой задачи планировщика...")
+    # Здесь можно добавить логику проверки дат в БД и автоматической отправки уведомлений
+    pass
+
 async def main():
     init_db()
+    
+    # Добавляем задачу в планировщик (будет запускаться каждый день в 10:00)
+    scheduler.add_job(background_reminder_task, "cron", hour=10, minute=0)
     scheduler.start()
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
