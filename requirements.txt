@@ -1,5 +1,5 @@
-aiogram>=3.0.0
-openai
-python-dotenv
+aiogram==3.15.0
 apscheduler
+openai
+pandas
 openpyxl
